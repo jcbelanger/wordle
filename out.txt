@@ -1,0 +1,2 @@
+best:['aurei' 'uraei' 'aesir' 'auloi' 'reais' 'realo' 'serai' 'ariel' 'aeros' 'ayrie']
+worst:['immix' 'jugum' 'fuffy' 'fuzzy' 'gyppy' 'yukky' 'kudzu' 'bubby' 'qajaq' 'susus']

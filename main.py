@@ -1,5 +1,8 @@
-from collections import Counter
 import numpy as np
+
+import dask
+import dask.array as da
+from dask.diagnostics import ProgressBar, Profiler, ResourceProfiler, CacheProfiler, visualize
 
 
 def words_of_len(file_name, n):
@@ -7,52 +10,75 @@ def words_of_len(file_name, n):
         return [word for word in word_list.read().splitlines() if len(word) == n]
 
 def main():
-    z = 5
+    z = 5 # word len
 
-    targets = words_of_len('wordlist.txt', z)
-    words = words_of_len('validGuesses.txt', z)
+    targets_str = words_of_len('wordlist.txt', z)
+    guesses_str = words_of_len('validGuesses.txt', z) + targets_str
 
-    letters = np.array(sorted(set().union(*map(set, words))))
+    # support non-alpha inputs
+    letters = np.array(sorted(set().union(*map(set, guesses_str))))
     letters_decode = {letter: ix for ix, letter in enumerate(letters)}
 
-    words_ix = np.array([[letters_decode[letter] for letter in word] for word in words])
-    targets_ix = np.array([[letters_decode[letter] for letter in word] for word in targets])
+    guesses = np.array([[letters_decode[letter] for letter in word] for word in guesses_str], dtype=np.int8)
+    targets = np.array([[letters_decode[letter] for letter in word] for word in targets_str], dtype=np.int8)
 
-    n = len(words)
+    n = len(guesses)
     m = len(targets)
 
-    compares = words_ix[:, None, :, None] == targets_ix[None, :, None, :]
+    cn = min(n, 128) # guesses chunk size n
+    cm1 = min(m, 256) # targets chunk size m1
+    cm2 = min(m, 2048) # targets chunk size m2
 
-    sat_counts = np.empty((n, m), dtype=int)
-    for i, guess_word in enumerate(words_ix):
-        guess_str = words[i]
-        for j, target_word in enumerate(targets_ix):
-            target_str = targets[j]
+    compares = guesses[:, None, :, None] == targets[None, :, None, :] # bool:nmzz
+    correct = np.diagonal(compares, axis1=-1, axis2=-2) # bool:nmz
+    present = np.any(compares, axis=-1) & ~correct # bool:nmz
+    absent = ~(correct | present) # bool:nmz
 
-            correct_letters = np.diagonal(compares[i, j])
-            present_letters = np.any(compares[i, j], axis=-1) & ~correct_letters
-            absent_letters = ~(correct_letters | present_letters)
+    correct_c = da.from_array(correct, chunks=(cn, cm1, z)) # bool:nmz
+    present_c = da.from_array(present, chunks=(cn, cm1, z)) # bool:nmz
+    absent_c = da.from_array(absent, chunks=(cn, cm1, z)) # bool:nmz
+    targets_c = da.from_array(targets, chunks=(cm2, z)) # int:mz
 
-            correct_sat = np.all(targets_ix[:, correct_letters] == guess_word[correct_letters], axis=1)
-            absent_sat = np.all(targets_ix[:, :, None] != guess_word[absent_letters], axis=(1, 2))
+    #correct_sat
+    null_ix = -1 # sentinal index value for matching itself and not other indexes
+    correct_guesses = np.where(correct_c[:, :, None, :], guesses[:, None, None, :], null_ix) # int:nm1z
+    correct_targets = da.where(correct_c[:, :, None, :], targets_c[None, None, :, :], null_ix) # int:nmmz
+    correct_compares = correct_guesses == correct_targets # bool:nmmz
+    correct_sat = da.all(correct_compares, axis=-1) # bool:nmm
 
-            present_compare = targets_ix[:, :, None] == guess_word[present_letters]
-            present_compare[:, np.arange(z)[present_letters], np.arange(np.sum(present_letters))] = False # cannot match present letters at their locations
-            present_sat = np.all(np.any(present_compare, axis=1), axis=1)
+    # present_sat
+    present_guesses = np.where(present_c[:, :, None, :], guesses[:, None, None, :], null_ix)  # int:nm1z
+    present_compares = present_guesses[..., None] == targets_c[None, None, :, None, :] # bool:nmmzz
+    present_compares = da.where(~present[:, :, None, :, None], present_compares, False) # bool:nmmzz - letter must be found elsewhere
+    present_sat = da.any(present_compares, axis=-1) # bool:nmmz
+    present_sat = present_sat | ~present[:, :, None, :] # bool:nmmz - ignore other results types
+    present_sat = da.all(present_sat, axis=-1) # bool:nmm
 
-            sat = correct_sat & present_sat & absent_sat
-            sat_count = np.sum(sat)
-            if sat_count == 0:
-                sat_count = n
-            sat_counts[i, j] = sat_count
+    #absent_sat
+    absent_guesses = da.where(absent_c[:, :, None, :], guesses[:, None, None, :], null_ix) # int:nm1z
+    absent_compares = absent_guesses[:, :, :, :, None] != targets_c[None, None, :, None, :] # bool:nmmzz
+    absent_sat = da.all(absent_compares, axis=(-1, -2))
 
-        scores = np.mean(sat_counts[:i+1], axis=1)
-        best = np.argmin(scores[np.isfinite(scores)])
-        best = np.arange(i+1)[np.isfinite(scores)][best]
-        print(f"Step {i+1}/{n} ({(i+1)/n:0.4f}%): '{words[i]}'={np.mean(sat_counts[i]):0.4f}, best: '{words[best]}'={np.mean(sat_counts[best]):0.4f}")
+    #compute top
+    sat = correct_sat & present_sat & absent_sat # bool:nmm
+    sat_avg = sat.sum(axis=-1).mean(axis=-1) # float:n
+    best_ix = da.argtopk(-sat_avg, k=10) # int:k
+    worst_ix = da.argtopk(sat_avg, k=10) # int:k
 
-    # best = np.argmax(entropy)
-    # print(f"Overall - best: '{words[best]}', entropy: {entropy[best]}")
+    pbar = ProgressBar()
+    prof = Profiler()
+    rprof = ResourceProfiler()
+    cprof = CacheProfiler()
+    with pbar, prof, rprof, cprof:
+        best_ix, worst_ix = dask.compute(best_ix, worst_ix)
+
+    best_guesses = np.take(guesses_str, best_ix)
+    worst_guesses = np.take(guesses_str, worst_ix)
+    print(f'best:{best_guesses}')
+    print(f'worst:{worst_guesses}')
+
+    visualize([prof, rprof, cprof], filename='profile.html')
+
 
 if __name__ == '__main__':
     main()
