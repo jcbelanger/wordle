@@ -1,8 +1,11 @@
 import numpy as np
 
+import psutil
+
 import dask
 import dask.array as da
 from dask.diagnostics import ProgressBar, Profiler, ResourceProfiler, CacheProfiler, visualize
+
 
 
 def words_of_len(file_name, n):
@@ -25,9 +28,13 @@ def main():
     n = len(guesses)
     m = len(targets)
 
-    cn = min(n, 128) # guesses chunk size n
-    cm1 = min(m, 256) # targets chunk size m1
-    cm2 = min(m, 2048) # targets chunk size m2
+    free = psutil.virtual_memory().free // 8
+    cpus = psutil.cpu_count()
+    compare_count = 0.9 * free // cpus // guesses.dtype.itemsize // targets.itemsize**2 // z**2
+
+    cm2 = 2**np.floor(np.log2(m)) # targets chunk size (m2)
+    cm1 = 2**np.floor(np.log2(compare_count // cm2)) # targets chunk size (m1)
+    cn = np.floor(compare_count // (cm1 * cm2)) # guesses chunk size (n)
 
     compares = guesses[:, None, :, None] == targets[None, :, None, :] # bool:nmzz
     correct = np.diagonal(compares, axis1=-1, axis2=-2) # bool:nmz
